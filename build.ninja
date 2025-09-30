@@ -1,0 +1,9 @@
+# Пример структуры:
+rule cpp_compiler
+  command = c++ -Iinclude -std=c++17 -c $in -o $out
+
+rule link_library
+  command = ar rcs $out $in
+
+build main.o: cpp_compiler main.cpp
+build libproject.a: link_library main.o

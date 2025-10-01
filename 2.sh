@@ -1,223 +1,675 @@
 #!/bin/bash
 
+# CachyOS Complete Migration Script with Kernel Installation
+# Usage: chmod +x cachyos_migration.sh && ./cachyos_migration.sh
+
+set -e  # Exit on any error
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
-# Функции для вывода
-print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
-print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
-print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
-print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+# Logging functions
+log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+log_step() { echo -e "${PURPLE}[STEP]${NC} $1"; }
+log_instruction() { echo -e "${CYAN}[INSTRUCTION]${NC} $1"; }
 
-# Проверка на root
-check_root() {
-    if [[ $EUID -eq 0 ]]; then
-        print_error "Этот скрипт не должен запускаться от root!"
-        exit 1
+# Global variables
+BACKUP_DIR="/tmp/cachyos_backup_$(date +%Y%m%d_%H%M%S)"
+ROLLBACK_FILE="/tmp/cachyos_rollback_$(date +%Y%m%d_%H%M%S).sh"
+MIGRATION_LOG="/tmp/cachyos_migration.log"
+SWAP_SIZE="30G"
+CURRENT_STEP=0
+TOTAL_STEPS=14
+
+# Check if running as root
+if [ "$EUID" -eq 0 ]; then
+    log_error "Please run as regular user, not root"
+    exit 1
+fi
+
+# Trap for cleanup on errors
+trap 'rollback_on_error' ERR
+trap 'cleanup_exit' EXIT
+
+# Rollback function
+rollback_on_error() {
+    log_error "Migration failed at step $CURRENT_STEP! Starting rollback..."
+    
+    if [ -f "$ROLLBACK_FILE" ]; then
+        log_warning "Executing rollback script..."
+        chmod +x "$ROLLBACK_FILE"
+        bash "$ROLLBACK_FILE" || true
+    fi
+    
+    log_error "Rollback completed. Check $MIGRATION_LOG for details"
+    exit 1
+}
+
+# Cleanup function
+cleanup_exit() {
+    if [ $? -eq 0 ]; then
+        log_success "Migration completed successfully!"
+    else
+        log_error "Migration failed! Check $MIGRATION_LOG"
     fi
 }
 
-# Проверка интернет соединения
-check_internet() {
-    print_info "Проверка интернет соединения..."
-    if ! ping -c 1 archlinux.org &> /dev/null; then
-        print_error "Нет интернет соединения!"
-        exit 1
-    fi
+# Display progress
+show_progress() {
+    CURRENT_STEP=$((CURRENT_STEP + 1))
+    log_step "Step $CURRENT_STEP/$TOTAL_STEPS: $1"
 }
 
-# Установка Hyprland и зависимостей
+# Create rollback script
+create_rollback_script() {
+    cat > "$ROLLBACK_FILE" << 'EOF'
+#!/bin/bash
+echo "Starting rollback process..."
+
+# Remove swap file if created
+if [ -f /swapfile ]; then
+    sudo swapoff /swapfile
+    sudo rm -f /swapfile
+    echo "Removed swap file"
+fi
+
+# Restore fstab if modified
+if grep -q "swapfile" /etc/fstab; then
+    sudo sed -i '/\/swapfile/d' /etc/fstab
+    echo "Restored fstab"
+fi
+
+# Restore pacman.conf if backup exists
+if [ -f /etc/pacman.conf.backup ]; then
+    sudo cp /etc/pacman.conf.backup /etc/pacman.conf
+    echo "Restored pacman.conf"
+fi
+
+# Remove CachyOS packages
+sudo pacman -Rns --noconfirm cachyos-package-manager cachyos-settings cachyos-skel 2>/dev/null || true
+sudo pacman -Rns --noconfirm cachyos-ksm-settings-git cachyos-ananicy-rules-git 2>/dev/null || true
+
+# Remove CachyOS kernel
+sudo pacman -Rns --noconfirm linux-cachyos linux-cachyos-headers 2>/dev/null || true
+
+# Remove Hyprland and related packages
+sudo pacman -Rns --noconfirm hyprland hyprpaper hypridle hyprlock 2>/dev/null || true
+sudo pacman -Rns --noconfirm waybar rofi-wayland dunst kitty 2>/dev/null || true
+
+# Remove office and utility packages
+sudo pacman -Rns --noconfirm libreoffice-fresh wireshark-qt gimp inkscape 2>/dev/null || true
+sudo pacman -Rns --noconfirm wine-staging winetricks anbox-git 2>/dev/null || true
+
+# Reinstall standard kernel if needed
+sudo pacman -S --noconfirm linux linux-headers 2>/dev/null || true
+
+# Update grub
+if command -v grub-mkconfig &> /dev/null; then
+    sudo grub-mkconfig -o /boot/grub/grub.cfg
+fi
+
+echo "Rollback completed. Please reboot."
+EOF
+    chmod +x "$ROLLBACK_FILE"
+    log_success "Rollback script created: $ROLLBACK_FILE"
+}
+
+# Function to install CachyOS kernel with fallback options
+install_cachyos_kernel() {
+    show_progress "Installing CachyOS kernel and optimization packages"
+    
+    log_info "Installing CachyOS kernel packages..."
+    
+    # Try to install binary packages first (faster)
+    if yay -S linux-cachyos linux-cachyos-headers --noconfirm --needed 2>/dev/null; then
+        log_success "CachyOS kernel installed successfully from binaries"
+        return 0
+    fi
+    
+    log_warning "Binary installation failed, trying with compilation..."
+    
+    # Set environment variables for compilation
+    export MAKEFLAGS="-j$(nproc)"
+    export COMPRESSXZ=(xz -c -z -T0 -)
+    
+    # Install kernel with compilation
+    if yay -S linux-cachyos linux-cachyos-headers --noconfirm --needed; then
+        log_success "CachyOS kernel compiled and installed successfully"
+        return 0
+    fi
+    
+    log_error "Failed to install CachyOS kernel"
+    return 1
+}
+
+# Function to install CachyOS optimization packages
+install_cachyos_optimizations() {
+    show_progress "Installing CachyOS optimization packages"
+    
+    log_info "Installing CachyOS system optimizations..."
+    
+    # Core CachyOS packages
+    cachyos_packages=(
+        "cachyos-keyring"
+        "cachyos-mirrorlist" 
+        "cachyos-package-manager"
+        "cachyos-settings"
+        "cachyos-skel"
+        "cachyos-ksm-settings-git"
+        "cachyos-ananicy-rules-git"
+        "cachyos-zram-config"
+        "cachyos-browser-settings"
+        "cachyos-gaming-git"
+    )
+    
+    # Install each package with error handling
+    for pkg in "${cachyos_packages[@]}"; do
+        log_info "Installing $pkg..."
+        if yay -S "$pkg" --noconfirm --needed 2>/dev/null; then
+            log_success "✓ $pkg installed"
+        else
+            log_warning "⚠ Failed to install $pkg, skipping..."
+        fi
+    done
+    
+    # Install additional performance packages
+    performance_packages=(
+        "ananicy-cpp"
+        "auto-cpufreq"
+        "gamemode"
+        "lib32-gamemode"
+        "cpupower"
+        "thermald"
+        "irqbalance"
+    )
+    
+    for pkg in "${performance_packages[@]}"; do
+        if sudo pacman -S "$pkg" --noconfirm --needed 2>/dev/null; then
+            log_success "✓ $pkg installed"
+        else
+            log_warning "⚠ Failed to install $pkg, skipping..."
+        fi
+    done
+    
+    # Enable services
+    sudo systemctl enable --now ananicy-cpp
+    sudo systemctl enable --now auto-cpufreq
+    sudo systemctl enable --now thermald
+    sudo systemctl enable --now irqbalance
+    
+    log_success "CachyOS optimization packages installed and configured"
+}
+
+# Backup function
+backup_system() {
+    show_progress "Creating system backup"
+    
+    mkdir -p "$BACKUP_DIR"
+    
+    # Backup package list
+    pacman -Qqe > "$BACKUP_DIR/package_list.txt"
+    
+    # Backup important configs
+    tar -czf "$BACKUP_DIR/home_backup.tar.gz" -C /home "$USER" --exclude=".cache" 2>/dev/null || true
+    tar -czf "$BACKUP_DIR/etc_backup.tar.gz" -C / etc 2>/dev/null || true
+    
+    # Backup dotfiles
+    cp -r ~/.config "$BACKUP_DIR/config_backup" 2>/dev/null || true
+    cp -r ~/.ssh "$BACKUP_DIR/ssh_backup" 2>/dev/null || true
+    
+    log_success "Backup completed to $BACKUP_DIR"
+}
+
+# Setup CachyOS repositories
+setup_repositories() {
+    show_progress "Setting up CachyOS repositories"
+    
+    # Backup original pacman.conf
+    sudo cp /etc/pacman.conf /etc/pacman.conf.backup
+    
+    # Add CachyOS repositories
+    cat >> /etc/pacman.conf << 'EOF'
+
+[cachyos]
+SigLevel = Optional TrustAll
+Server = https://mirror.cachyos.org/repo/$arch/$repo
+
+[cachyos-extra]
+SigLevel = Optional TrustAll
+Server = https://mirror.cachyos.org/repo/$arch/$repo
+
+[core-x86-64-v3]
+SigLevel = Optional TrustAll
+Server = https://mirror.cachyos.org/repo/$arch/$repo
+
+[core-x86-64-v4]
+SigLevel = Optional TrustAll
+Server = https://mirror.cachyos.org/repo/$arch/$repo
+EOF
+    
+    # Update package database
+    sudo pacman -Syy
+    log_success "Repositories configured"
+}
+
+# Create and configure swap file
+setup_swap_file() {
+    show_progress "Creating ${SWAP_SIZE} swap file"
+    
+    # Check if swap already exists
+    if swapon --show | grep -q "/swapfile"; then
+        log_info "Swap file already exists, skipping creation"
+        return 0
+    fi
+    
+    # Create swap file
+    sudo fallocate -l "$SWAP_SIZE" /swapfile
+    sudo chmod 600 /swapfile
+    sudo mkswap /swapfile
+    sudo swapon /swapfile
+    
+    # Add to fstab
+    if ! grep -q "/swapfile" /etc/fstab; then
+        echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+    fi
+    
+    # Optimize swap settings
+    if ! grep -q "vm.swappiness" /etc/sysctl.d/99-swap.conf 2>/dev/null; then
+        echo 'vm.swappiness=10' | sudo tee -a /etc/sysctl.d/99-swap.conf
+        echo 'vm.vfs_cache_pressure=50' | sudo tee -a /etc/sysctl.d/99-swap.conf
+        echo 'vm.dirty_ratio=15' | sudo tee -a /etc/sysctl.d/99-swap.conf
+        echo 'vm.dirty_background_ratio=5' | sudo tee -a /etc/sysctl.d/99-swap.conf
+    fi
+    
+    # Apply settings
+    sudo sysctl -p /etc/sysctl.d/99-swap.conf
+    
+    log_success "${SWAP_SIZE} swap file created and configured"
+}
+
+# Install office and productivity software
+install_office_software() {
+    show_progress "Installing office and productivity software"
+    
+    # Office suite
+    office_packages=(
+        "libreoffice-fresh" "libreoffice-fresh-ru"
+        "hunspell" "hunspell-ru" "hyphen" "hyphen-ru"
+        "mythes" "mythes-ru"
+    )
+    
+    # Graphics and media
+    media_packages=(
+        "gimp" "inkscape" "kdenlive" "obs-studio"
+        "vlc" "mpv" "ffmpeg" "imagemagick"
+        "gthumb" "eog"
+    )
+    
+    # Network and utilities
+    network_packages=(
+        "wireshark-qt" "nmap" "whois" "dnsutils"
+        "net-tools" "tcpdump" "wget" "curl"
+        "filezilla" "remmina" "freerdp"
+    )
+    
+    # Development tools
+    dev_packages=(
+        "git" "github-cli" "vim" "neovim" "vscode"
+        "python" "python-pip" "nodejs" "npm"
+        "docker" "docker-compose" "jdk-openjdk"
+        "base-devel" "cmake" "ninja"
+    )
+    
+    # Install all categories
+    log_info "Installing office suite..."
+    for pkg in "${office_packages[@]}"; do
+        sudo pacman -S "$pkg" --noconfirm --needed 2>/dev/null || log_warning "Failed to install $pkg"
+    done
+    
+    log_info "Installing media software..."
+    for pkg in "${media_packages[@]}"; do
+        sudo pacman -S "$pkg" --noconfirm --needed 2>/dev/null || log_warning "Failed to install $pkg"
+    done
+    
+    log_info "Installing network tools..."
+    for pkg in "${network_packages[@]}"; do
+        sudo pacman -S "$pkg" --noconfirm --needed 2>/dev/null || log_warning "Failed to install $pkg"
+    done
+    
+    log_info "Installing development tools..."
+    for pkg in "${dev_packages[@]}"; do
+        sudo pacman -S "$pkg" --noconfirm --needed 2>/dev/null || log_warning "Failed to install $pkg"
+    done
+    
+    log_success "Office and productivity software installed"
+}
+
+# Install Wine and Windows compatibility
+install_wine() {
+    show_progress "Installing Wine and Windows compatibility"
+    
+    # Wine and dependencies
+    wine_packages=(
+        "wine-staging" "winetricks" "wine-gecko" "wine-mono"
+        "lib32-mesa" "lib32-libpulse" "lib32-alsa-plugins"
+        "lib32-libxcomposite" "lib32-libxinerama" "lib32-opencl-icd-loader"
+        "giflib" "lib32-giflib" "libpng" "lib32-libpng"
+        "libldap" "lib32-libldap" "gnutls" "lib32-gnutls"
+        "mpg123" "lib32-mpg123" "openal" "lib32-openal"
+        "v4l-utils" "lib32-v4l-utils" "libpulse" "lib32-libpulse"
+        "alsa-plugins" "lib32-alsa-plugins" "alsa-lib" "lib32-alsa-lib"
+        "libjpeg-turbo" "lib32-libjpeg-turbo" "sqlite" "lib32-sqlite"
+        "libxcomposite" "lib32-libxcomposite" "libxinerama" "lib32-libxinerama"
+        "ncurses" "lib32-ncurses" "opencl-icd-loader" "lib32-opencl-icd-loader"
+        "libxslt" "lib32-libxslt" "libva" "lib32-libva"
+        "gtk3" "lib32-gtk3" "gst-plugins-base-libs" "lib32-gst-plugins-base-libs"
+    )
+    
+    log_info "Installing Wine and dependencies..."
+    for pkg in "${wine_packages[@]}"; do
+        sudo pacman -S "$pkg" --noconfirm --needed 2>/dev/null || log_warning "Failed to install $pkg"
+    done
+    
+    # Configure Wine
+    log_info "Configuring Wine..."
+    winecfg &
+    sleep 5
+    pkill -f winecfg
+    
+    log_success "Wine and Windows compatibility layer installed"
+}
+
+# Install Anbox for Android apps
+install_anbox() {
+    show_progress "Installing Anbox for Android apps"
+    
+    # Install Anbox
+    if ! sudo pacman -S anbox-git --noconfirm --needed 2>/dev/null; then
+        log_warning "Anbox not available in repositories, building from AUR..."
+        yay -S anbox-git --noconfirm --needed || log_warning "Failed to install Anbox"
+    fi
+    
+    # Load Anbox kernel modules
+    sudo modprobe ashmem_linux
+    sudo modprobe binder_linux
+    
+    # Make module loading permanent
+    if ! grep -q "ashmem_linux" /etc/modules-load.d/anbox.conf 2>/dev/null; then
+        echo 'ashmem_linux' | sudo tee /etc/modules-load.d/anbox.conf
+        echo 'binder_linux' | sudo tee -a /etc/modules-load.d/anbox.conf
+    fi
+    
+    # Start Anbox service
+    sudo systemctl enable --now anbox-session-manager
+    
+    log_success "Anbox installed and configured"
+}
+
+# Install Hyprland with complete setup
 install_hyprland() {
-    print_info "Установка Hyprland и зависимостей..."
+    show_progress "Installing Hyprland desktop environment"
     
-    # Обновление системы
-    sudo pacman -Syu --noconfirm
+    # Install Hyprland and dependencies
+    hyprland_packages=(
+        "hyprland" "hyprpaper" "hypridle" "hyprlock" "hyprpicker"
+        "waybar" "rofi-wayland" "dunst" "kitty" "alacritty"
+        "thunar" "thunar-archive-plugin" "thunar-volman"
+        "firefox" "chromium" "nautilus" "grim" "slurp"
+        "wl-clipboard" "brightnessctl" "pamixer" "pulseaudio" "pulseaudio-alsa"
+        "polkit-kde-agent" "qt5-wayland" "qt6-wayland" "xdg-desktop-portal-hyprland"
+        "nemo" "neofetch" "htop" "bat" "eza" "fd" "fzf" "ripgrep"
+        "git" "vim" "neovim" "wget" "curl" "unzip" "zip" "p7zip"
+        "ttf-jetbrains-mono-nerd" "ttf-firacode-nerd" "ttf-roboto-mono-nerd"
+        "noto-fonts" "noto-fonts-cjk" "noto-fonts-emoji" "ttf-dejavu"
+        "adwaita-icon-theme" "papirus-icon-theme" "arc-gtk-theme"
+    )
     
-    # Установка основных пакетов
-    sudo pacman -S --needed --noconfirm \
-        wayland \
-        xorg-xwayland \
-        mesa \
-        vulkan-icd-loader \
-        base-devel \
-        git \
-        cmake \
-        ninja \
-        gcc
+    for pkg in "${hyprland_packages[@]}"; do
+        if ! sudo pacman -S "$pkg" --noconfirm --needed 2>/dev/null; then
+            log_warning "Failed to install $pkg, continuing..."
+        fi
+    done
     
-    # Установка Hyprland
-    sudo pacman -S --needed --noconfirm hyprland
+    # Create Hyprland configuration
+    setup_hyprland_config
     
-    # Установка графического менеджера (SDDM)
-    sudo pacman -S --needed --noconfirm sddm
-    
-    # Установка необходимых утилит
-    sudo pacman -S --needed --noconfirm \
-        kitty \
-        thunar \
-        firefox \
-        nano \
-        networkmanager \
-        pulseaudio \
-        pulseaudio-alsa \
-        pavucontrol \
-        brightnessctl \
-        playerctl \
-        wl-clipboard \
-        qt5-wayland \
-        qt6-wayland \
-        noto-fonts \
-        noto-fonts-emoji \
-        waybar \
-        rofi \
-        dunst \
-        swaybg \
-        swaylock \
-        grim \
-        slurp \
-        wlogout
+    log_success "Hyprland installation completed"
 }
 
-# Настройка конфигурации Hyprland
-configure_hyprland() {
-    print_info "Настройка конфигурации Hyprland..."
+# Setup Hyprland configuration
+setup_hyprland_config() {
+    show_progress "Configuring Hyprland"
     
-    # Создание директорий конфигурации
     mkdir -p ~/.config/hypr
     mkdir -p ~/.config/waybar
-    mkdir -p ~/.config/dunst
     
-    # Создание основного конфига Hyprland
+    # Create comprehensive Hyprland config
     cat > ~/.config/hypr/hyprland.conf << 'EOF'
-# Монитор
-monitor=,preferred,auto,auto
+# Hyprland Configuration File
+# Complete configuration with optimizations
 
-# Автозапуск приложений
-exec-once = waybar
-exec-once = dunst
-exec-once = nm-applet
-exec-once = swaybg -i ~/.config/hypr/wallpaper.jpg
+monitor=,preferred,auto,1
 
-# Ввод
+# Auto-execute essential services
+exec-once = waybar &
+exec-once = dunst &
+exec-once = hyprpaper &
+exec-once = /usr/lib/polkit-kde-authentication-agent-1
+exec-once = dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP
+exec-once = systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP
+exec-once = xdg-desktop-portal-hyprland &
+
+# Performance optimizations
+exec-once = sleep 5 && systemctl --user start gamemoded
+exec-once = auto-cpufreq &
+
+# Input configuration
 input {
     kb_layout = us,ru
     kb_options = grp:alt_shift_toggle
     follow_mouse = 1
     touchpad {
         natural_scroll = no
+        tap-to-click = yes
+        disable_while_typing = true
     }
+    sensitivity = 0
+    repeat_delay = 250
+    repeat_rate = 35
 }
 
-# Общие настройки
+# General appearance
 general {
     gaps_in = 5
-    gaps_out = 20
+    gaps_out = 10
     border_size = 2
     col.active_border = rgba(33ccffee) rgba(00ff99ee) 45deg
     col.inactive_border = rgba(595959aa)
     layout = dwindle
+    cursor_inactive_timeout = 5
+    no_cursor_warps = true
 }
 
-# Оформление
+# Decoration effects
 decoration {
     rounding = 10
     blur {
         enabled = true
-        size = 3
-        passes = 1
+        size = 5
+        passes = 2
+        new_optimizations = true
+        ignore_opacity = true
     }
     drop_shadow = yes
-    shadow_range = 4
+    shadow_range = 10
     shadow_render_power = 3
     col.shadow = rgba(1a1a1aee)
+    active_opacity = 1.0
+    inactive_opacity = 0.9
+    fullscreen_opacity = 1.0
 }
 
-# Анимации
+# Animations
 animations {
     enabled = yes
     bezier = myBezier, 0.05, 0.9, 0.1, 1.05
-    animation = windows, 1, 7, myBezier
-    animation = windowsOut, 1, 7, default, popin 80%
-    animation = border, 1, 10, default
+    bezier = linear, 0.0, 0.0, 1.0, 1.0
+    
+    animation = windows, 1, 7, myBezier, slide
+    animation = windowsOut, 1, 7, myBezier, slide
+    animation = border, 1, 10, linear
     animation = fade, 1, 7, default
-    animation = workspaces, 1, 6, default
+    animation = workspaces, 1, 6, default, slidevert
 }
 
-# Раскладка окон
+# Layout configurations
 dwindle {
     pseudotile = yes
     preserve_split = yes
+    force_split = 0
+    special_scale_factor = 0.8
 }
 
-# Жесты
+master {
+    new_is_master = true
+    special_scale_factor = 0.8
+}
+
 gestures {
     workspace_swipe = on
+    workspace_swipe_distance = 250
+    workspace_swipe_invert = true
+    workspace_swipe_min_speed_to_force = 15
 }
 
-# Биндинги клавиш
-bind = SUPER, Q, exec, kitty
-bind = SUPER, C, killactive,
+# Key bindings - Essential
+bind = SUPER, RETURN, exec, kitty
+bind = SUPER, Q, killactive,
 bind = SUPER, M, exit,
-bind = SUPER, E, exec, thunar
+bind = SUPER, E, exec, nemo
+bind = SUPER, D, exec, rofi -show drun
 bind = SUPER, V, togglefloating,
-bind = SUPER, R, exec, rofi -show drun
+bind = SUPER, R, exec, rofi -show run
 bind = SUPER, P, pseudo,
 bind = SUPER, F, fullscreen,
+bind = SUPER, Space, exec, rofi -show window
 
-# Перемещение между окнами
+# Application shortcuts
+bind = SUPER, W, exec, firefox
+bind = SUPER, O, exec, libreoffice
+bind = SUPER, G, exec, gimp
+bind = SUPER, T, exec, thunar
+
+# Move focus
 bind = SUPER, left, movefocus, l
 bind = SUPER, right, movefocus, r
 bind = SUPER, up, movefocus, u
 bind = SUPER, down, movefocus, d
 
-# Переключение рабочих столов
+# Switch workspaces
 bind = SUPER, 1, workspace, 1
 bind = SUPER, 2, workspace, 2
 bind = SUPER, 3, workspace, 3
 bind = SUPER, 4, workspace, 4
+bind = SUPER, 5, workspace, 5
+bind = SUPER, 6, workspace, 6
+bind = SUPER, 7, workspace, 7
+bind = SUPER, 8, workspace, 8
+bind = SUPER, 9, workspace, 9
+bind = SUPER, 0, workspace, 10
 
-# Перемещение окон на рабочие столы
+# Move windows to workspace
 bind = SUPER SHIFT, 1, movetoworkspace, 1
 bind = SUPER SHIFT, 2, movetoworkspace, 2
 bind = SUPER SHIFT, 3, movetoworkspace, 3
 bind = SUPER SHIFT, 4, movetoworkspace, 4
+bind = SUPER SHIFT, 5, movetoworkspace, 5
+bind = SUPER SHIFT, 6, movetoworkspace, 6
+bind = SUPER SHIFT, 7, movetoworkspace, 7
+bind = SUPER SHIFT, 8, movetoworkspace, 8
+bind = SUPER SHIFT, 9, movetoworkspace, 9
+bind = SUPER SHIFT, 0, movetoworkspace, 10
 
-# Управление медиа
+# Special workspace (scratchpad)
+bind = SUPER, S, togglespecialworkspace, magic
+bind = SUPER SHIFT, S, movetoworkspace, special:magic
+
+# Scroll through workspaces
+bind = SUPER, mouse_down, workspace, e+1
+bind = SUPER, mouse_up, workspace, e-1
+
+# Move/resize windows
+bindm = SUPER, mouse:272, movewindow
+bindm = SUPER, mouse:273, resizewindow
+
+# Multimedia keys
 bind = , XF86AudioRaiseVolume, exec, pamixer -i 5
 bind = , XF86AudioLowerVolume, exec, pamixer -d 5
 bind = , XF86AudioMute, exec, pamixer -t
+bind = , XF86AudioPlay, exec, playerctl play-pause
+bind = , XF86AudioNext, exec, playerctl next
+bind = , XF86AudioPrev, exec, playerctl previous
 bind = , XF86MonBrightnessUp, exec, brightnessctl set +5%
 bind = , XF86MonBrightnessDown, exec, brightnessctl set 5%-
 
-# Скриншоты
+# Screenshot
 bind = , PRINT, exec, grim -g "$(slurp)" - | wl-copy
 bind = SUPER, PRINT, exec, grim - | wl-copy
+bind = SUPER SHIFT, S, exec, grim -g "$(slurp)" - | tee ~/Pictures/screenshot.png | wl-copy
 
-# Блокировка экрана
-bind = SUPER, L, exec, swaylock
+# Reload Hyprland configuration
+bind = SUPER SHIFT, C, exec, hyprctl reload
 
-# Меню выхода
-bind = SUPER, X, exec, wlogout
+# Performance monitoring
+bind = SUPER SHIFT, P, exec, kitty htop
+
+# Window rules
+windowrule = float,^(pavucontrol)$
+windowrule = float,^(blueman-manager)$
+windowrule = float,^(nm-connection-editor)$
+windowrule = float,^(org.gnome.Calculator)$
+windowrule = float,^(Wine)$
+windowrule = float,^(anbox)$
+windowrule = size 800 600,^(pavucontrol)$
+windowrule = size 1000 700,^(blueman-manager)$
+
+# Layer rules
+layerrule = blur,waybar
+layerrule = ignorezero,waybar
+layerrule = blur,rofi
+layerrule = ignorezero,rofi
+
+# Environment variables
+env = XCURSOR_SIZE,24
+env = QT_QPA_PLATFORM,wayland
+env = SDL_VIDEODRIVER,wayland
+env = MOZ_ENABLE_WAYLAND,1
+env = XDG_SESSION_TYPE,wayland
+env = XDG_CURRENT_DESKTOP,Hyprland
 EOF
 
-    # Создание конфига Waybar
+    # Create Waybar config
     cat > ~/.config/waybar/config << 'EOF'
 {
     "layer": "top",
     "position": "top",
     "height": 35,
     "spacing": 4,
-    
     "modules-left": ["hyprland/workspaces"],
     "modules-center": ["clock"],
-    "modules-right": ["cpu", "memory", "battery", "pulseaudio", "network", "tray"],
+    "modules-right": ["cpu", "memory", "temperature", "battery", "pulseaudio", "tray"],
     
     "hyprland/workspaces": {
-        "disable-scroll": true,
+        "disable-scroll": false,
         "all-outputs": true,
         "format": "{icon}",
         "format-icons": {
@@ -225,137 +677,285 @@ EOF
             "2": "",
             "3": "",
             "4": "",
-            "5": ""
+            "5": "",
+            "6": "",
+            "7": "",
+            "8": "",
+            "9": "",
+            "10": ""
         }
     },
     
     "clock": {
-        "format": "{:%H:%M}",
-        "format-alt": "{:%Y-%m-%d}"
+        "format": " {:%H:%M}",
+        "format-alt": " {:%Y-%m-%d}",
+        "tooltip-format": "<big>{:%Y %B}</big>\n<tt><small>{calendar}</small></tt>"
     },
     
     "cpu": {
-        "format": "{usage}% ",
-        "tooltip": false
+        "format": " {usage}%",
+        "interval": 5
     },
     
     "memory": {
-        "format": "{}% "
+        "format": " {}%",
+        "interval": 5
+    },
+    
+    "temperature": {
+        "thermal-zone": 0,
+        "format": " {temperatureC}°C",
+        "critical-threshold": 80,
+        "format-critical": " {temperatureC}°C"
     },
     
     "battery": {
         "format": "{capacity}% {icon}",
-        "format-icons": ["", "", "", "", ""]
-    },
-    
-    "network": {
-        "format-wifi": "{essid} ({signalStrength}%) ",
-        "format-ethernet": "{ifname} ",
-        "format-disconnected": "Disconnected ⚠",
-        "tooltip-format": "{ifname}: {ipaddr}/{cidr}"
+        "format-icons": ["", "", "", "", ""],
+        "format-charging": " {capacity}%"
     },
     
     "pulseaudio": {
         "format": "{volume}% {icon}",
-        "format-muted": "",
-        "format-icons": ["", "", ""]
+        "format-muted": " MUTE",
+        "format-icons": ["", "", ""],
+        "on-click": "pamixer -t",
+        "on-scroll-up": "pamixer -i 5",
+        "on-scroll-down": "pamixer -d 5"
+    },
+    
+    "tray": {
+        "icon-size": 15,
+        "spacing": 5
     }
 }
 EOF
 
-    # Создание скрипта для обоев
-    cat > ~/.config/hypr/set-wallpaper.sh << 'EOF'
-#!/bin/bash
-# Скачивание обоев по умолчанию (можно заменить на свои)
-if [ ! -f ~/.config/hypr/wallpaper.jpg ]; then
-    curl -s -o ~/.config/hypr/wallpaper.jpg "https://picsum.photos/1920/1080"
-fi
-swaybg -i ~/.config/hypr/wallpaper.jpg &
+    # Create Hyprpaper config
+    mkdir -p ~/.config/hypr
+    cat > ~/.config/hypr/hyprpaper.conf << 'EOF'
+preload = /usr/share/backgrounds/archlinux/awesome.png
+wallpaper = ,/usr/share/backgrounds/archlinux/awesome.png
 EOF
 
-    chmod +x ~/.config/hypr/set-wallpaper.sh
-    
-    print_success "Конфигурация Hyprland создана!"
+    log_success "Hyprland configuration created"
 }
 
-# Включение служб
-enable_services() {
-    print_info "Включение системных служб..."
+# Final setup steps
+finalize_setup() {
+    show_progress "Finalizing system setup"
     
-    # Включение SDDM
-    sudo systemctl enable sddm
+    # Update grub configuration
+    if command -v grub-mkconfig &> /dev/null; then
+        sudo grub-mkconfig -o /boot/grub/grub.cfg
+        log_success "GRUB configuration updated"
+    fi
     
-    # Включение NetworkManager
-    sudo systemctl enable NetworkManager
+    # Update systemd-boot if used
+    if [ -d /boot/loader/entries ]; then
+        sudo bootctl update
+        log_success "systemd-boot updated"
+    fi
     
-    # Включение PulseAudio
-    systemctl --user enable pulseaudio
+    # Copy CachyOS skel files
+    if [ -d /etc/skel ] && [ -d /etc/skel/.config ]; then
+        cp -r /etc/skel/. ~/ 2>/dev/null || true
+    fi
     
-    print_success "Службы включены!"
+    # Set proper ownership
+    sudo chown -R $USER:$USER ~/
+    
+    # Enable services
+    if command -v systemctl &> /dev/null; then
+        sudo systemctl enable --now ananicy-cpp 2>/dev/null || true
+        sudo systemctl enable --now auto-cpufreq 2>/dev/null || true
+        sudo systemctl enable --now docker 2>/dev/null || true
+        sudo usermod -aG docker $USER
+    fi
+    
+    # Configure Docker without sudo
+    sudo groupadd docker 2>/dev/null || true
+    sudo usermod -aG docker $USER
+    
+    log_success "Final setup completed"
 }
 
-# Создание скрипта запуска
-create_launch_script() {
-    print_info "Создание скрипта запуска..."
-    
-    cat > ~/start-hyprland.sh << 'EOF'
-#!/bin/bash
-
-# Проверка Wayland сессии
-if [ "$XDG_SESSION_TYPE" != "wayland" ]; then
-    echo "Запуск Hyprland..."
-    exec Hyprland
-else
-    echo "Wayland сессия уже запущена!"
-fi
-EOF
-
-    chmod +x ~/start-hyprland.sh
-    
-    # Создание desktop файла для автозапуска
-    mkdir -p ~/.config/autostart
-    cat > ~/.config/autostart/hyprland-setup.desktop << 'EOF'
-[Desktop Entry]
-Type=Application
-Name=Hyprland Setup
-Exec=/home/$USER/.config/hypr/set-wallpaper.sh
-Hidden=false
-NoDisplay=false
-X-GNOME-Autostart-enabled=true
-EOF
-
-    print_success "Скрипты запуска созданы!"
+# Display Hyprland instructions
+show_hyprland_instructions() {
+    echo
+    log_instruction "=== HYPRLAND INSTRUCTIONS ==="
+    log_instruction "After reboot, you can start Hyprland in several ways:"
+    echo
+    log_instruction "METHOD 1: From TTY (Ctrl+Alt+F2):"
+    log_instruction "  1. Switch to TTY: Ctrl + Alt + F2"
+    log_instruction "  2. Login with your credentials"
+    log_instruction "  3. Type: Hyprland"
+    log_instruction "  4. To return to TTY: Ctrl + Alt + F2"
+    echo
+    log_instruction "METHOD 2: From Display Manager:"
+    log_instruction "  1. Reboot and wait for login screen"
+    log_instruction "  2. Select 'Hyprland' from session menu"
+    log_instruction "  3. Login normally"
+    echo
+    log_instruction "KEYBINDINGS:"
+    log_instruction "  SUPER + Enter - Terminal (kitty)"
+    log_instruction "  SUPER + Q - Close window"
+    log_instruction "  SUPER + D - App launcher (rofi)"
+    log_instruction "  SUPER + W - Firefox"
+    log_instruction "  SUPER + O - LibreOffice"
+    log_instruction "  SUPER + G - GIMP"
+    log_instruction "  SUPER + E - File manager"
+    log_instruction "  SUPER + 1-9 - Switch workspaces"
+    echo
+    log_instruction "INSTALLED SOFTWARE:"
+    log_instruction "  Office: LibreOffice, GIMP, Inkscape"
+    log_instruction "  Media: VLC, OBS Studio, Kdenlive"
+    log_instruction "  Tools: Wireshark, Docker, Wine, Anbox"
+    log_instruction "  Development: VS Code, Git, Node.js, Python"
+    echo
+    log_instruction "OPTIMIZATIONS:"
+    log_instruction "  ${SWAP_SIZE} swap file created"
+    log_instruction "  CachyOS kernel with performance patches"
+    log_instruction "  GameMode for gaming optimization"
+    log_instruction "  Auto-cpufreq for power management"
+    log_instruction "  Ananicy for process prioritization"
+    echo
 }
 
-# Финальная настройка
-final_setup() {
-    print_info "Выполнение финальной настройки..."
+# System verification
+verify_installation() {
+    show_progress "Verifying installation"
     
-    # Установка прав на шрифты
-    fc-cache -fv
+    local errors=0
+    local warnings=0
     
-    # Создание необходимых директорий
-    mkdir -p ~/.cache/{waybar,dunst}
+    # Check if key packages are installed
+    for pkg in hyprland waybar kitty firefox; do
+        if ! pacman -Q "$pkg" &>/dev/null; then
+            log_warning "Package $pkg is not installed"
+            ((warnings++))
+        fi
+    done
     
-    print_success "Финальная настройка завершена!"
+    # Check CachyOS kernel
+    if ! pacman -Q linux-cachyos &>/dev/null; then
+        log_error "CachyOS kernel is not installed"
+        ((errors++))
+    fi
+    
+    # Check swap
+    if ! swapon --show | grep -q "/swapfile"; then
+        log_warning "Swap file is not active"
+        ((warnings++))
+    fi
+    
+    # Check running kernel
+    current_kernel=$(uname -r)
+    if [[ "$current_kernel" != *"cachyos"* ]]; then
+        log_warning "Not running CachyOS kernel (current: $current_kernel)"
+        ((warnings++))
+    fi
+    
+    if [ $errors -eq 0 ] && [ $warnings -eq 0 ]; then
+        log_success "Installation verification passed - all systems go!"
+    elif [ $errors -eq 0 ]; then
+        log_warning "Installation has $warnings minor warnings, but should work fine"
+    else
+        log_error "Installation has $errors errors and $warnings warnings"
+    fi
 }
 
-# Основная функция
-main() {
-    print_info "Начало установки Hyprland..."
+# Automatic reboot prompt
+prompt_reboot() {
+    echo
+    log_instruction "=== MIGRATION COMPLETED ==="
+    log_success "All steps completed successfully!"
+    echo
     
-    check_root
-    check_internet
+    read -p "Do you want to reboot now? (y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        log_info "Rebooting in 5 seconds... Press Ctrl+C to cancel"
+        sleep 5
+        sudo reboot
+    else
+        log_info "Please reboot manually when ready: sudo reboot"
+        log_info "Remember to select CachyOS kernel in bootloader!"
+    fi
+}
+
+# Main migration function
+migrate_to_cachyos() {
+    log_info "Starting complete migration from Arch to CachyOS..."
+    log_info "Log file: $MIGRATION_LOG"
+    
+    # Create rollback script first
+    create_rollback_script
+    
+    # Execute all migration steps
+    backup_system
+    setup_repositories
+    install_cachyos_kernel
+    install_cachyos_optimizations
+    setup_swap_file
+    install_office_software
+    install_wine
+    install_anbox
     install_hyprland
-    configure_hyprland
-    enable_services
-    create_launch_script
-    final_setup
+    finalize_setup
+    verify_installation
     
-    print_success "Установка Hyprland завершена!"
-    print_warning "Перезагрузите систему для применения изменений: sudo reboot"
-    print_info "После перезагрузки выберите Hyprland в меню SDDM"
+    # Show instructions
+    show_hyprland_instructions
+    
+    # Prompt for reboot
+    prompt_reboot
 }
 
-# Запуск основной функции
+# Display welcome message
+show_welcome() {
+    clear
+    echo -e "${GREEN}"
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║           CachyOS Complete Migration Script             ║"
+    echo "║      with Kernel Installation & Full Software Suite     ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+    echo "This script will install:"
+    echo "✓ CachyOS kernel with performance optimizations"
+    echo "✓ All CachyOS optimization packages"
+    echo "✓ Hyprland desktop environment" 
+    echo "✓ ${SWAP_SIZE} swap file for performance"
+    echo "✓ LibreOffice, GIMP, Inkscape, OBS Studio"
+    echo "✓ Wireshark, development tools, Docker"
+    echo "✓ Wine + Windows compatibility"
+    echo "✓ Anbox for Android apps"
+    echo "✓ Gaming optimizations (GameMode)"
+    echo "✓ Power management (auto-cpufreq, TLP)"
+    echo
+    log_warning "Ensure you have:"
+    log_warning "  - Stable internet connection"
+    log_warning "  - At least 40GB free disk space"
+    log_warning "  - Backup of important data"
+    log_warning "  - 2-3 hours time for compilation (if needed)"
+    echo
+}
+
+# Main execution
+main() {
+    exec > >(tee -a "$MIGRATION_LOG") 2>&1
+    
+    show_welcome
+    
+    read -p "Do you want to proceed with migration? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log_info "Migration cancelled by user"
+        exit 0
+    fi
+    
+    migrate_to_cachyos
+}
+
+# Run main function
 main "$@"
